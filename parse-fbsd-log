@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import pickle
+import re
+import sys
+
+from log import *
+from re import compile as regex
+
+args = argparse.ArgumentParser()
+args.add_argument('filename', nargs = '?')
+args.add_argument('-o', '--output', default = 'build.db')
+
+args = args.parse_args()
+
+
+f = open(args.filename, 'r') if args.filename else sys.stdin
+out_file = open(args.output, 'wb')
+
+
+src_root = None
+objdirs = {}
+
+status_messages = []
+dirs_entered = []
+
+execs = []
+submake = []
+
+warnings = []
+errors = []
+unparsed = []
+
+def entering(directory, ops): dirs_entered.append((directory, ops.split()))
+def status(msg): status_messages.append(msg)
+
+def srcdir(src):
+	global src_root
+	if src_root: assert src == src_root
+	else: src_root = src
+
+def objdir(obj, src): objdirs[src] = obj
+
+def cc(args): execs.append(('cc', args.split()))
+def cxx(args): execs.append(('cxx', args.split()))
+def echo(args): execs.append(('echo', args.split()))
+def install(args, dest): execs.append(('install.sh', (args, dest))),
+
+def other_tool(name, args):
+	execs.append((name, args.split()))
+
+# pattern for a filename
+filep = '[a-zA-Z0-9/_\-\.\+]+'
+
+patterns = (
+	# basic UNIX file utilities
+	(regex('^(awk|ln|mkdep|mkdir|mtree|ranlib|rm) (.*)$'), other_tool),
+
+	# echo (might be special, e.g. echoing into a build file)
+	(regex('^echo (.*)$'), echo),
+
+	# file installation (staging)
+	(
+		regex('sh (%s/tools/install.sh) (.*) (/%s)' % (filep, filep)),
+		lambda src_root, args, dest:
+			(srcdir(src_root), install(args.split(), dest))
+	),
+
+	# file copying
+	(
+		regex('^cp (%s)+ (%s)$' % (filep, filep)),
+		lambda *files:
+			execs.append(('cp',
+				run(files[:-1], outputs = files[-1:])))
+	),
+
+	# C compilation
+	(regex('cc (.*)'), cc),
+
+	# C++
+	(regex('c\+\+ (.*)'), cxx),
+
+	# make-roken (a kerberos thing)
+	(
+		regex('^(make-roken) > (%s)$' % filep),
+		lambda name, out: execs.append((name, run(outputs = [ out ])))
+	),
+
+	# Clang warning
+	(
+		regex('^(%s):([0-9]+):([0-9]+): warning: (.*)$' % filep),
+		lambda filename, line, col, message:
+			warnings.append(diag(filename, line, col, message))
+	),
+
+	# Clang note (more information about a warning)
+	(
+		regex('^(%s):([0-9]+):([0-9]+): note: (.*)$' % filep),
+		lambda filename, line, col, message:
+			warnings[-1].add_note(filename, line, col, message)
+	),
+
+	# code line location
+	(
+		regex('^([ ~]*\^[ ~]*)'),
+		lambda caret_line:
+			warnings[-1].add_code(unparsed.pop(), caret_line)
+	),
+	(
+		regex('^( +\( *\))$'),
+		lambda sugg_parens: warnings[-1].add_suggestion(sugg_parens)
+	),
+
+	# rpcgen
+	(regex('^RPCGEN_CPP=.*(rpcgen) (.* %s)$' % filep), other_tool),
+
+	# sometimes rm *.o commands wrap around in the log... (!?)
+	(
+		regex('^((?:%s\.o(?:.tmp)?\s+)+)' % filep),
+		lambda files: execs[-1][1].append(files[0].split())
+	),
+
+	# yacc warning
+	(
+		regex('^(yacc): (.*)$'),
+		lambda name, msg: warnings.append(diag(None, -1, -1, msg))
+	),
+
+	# visual separator
+	(regex('^-+$'), lambda: None),
+
+	# progress messages
+	(regex('^===> (%s) \(([a-z,\-]+)\)$' % filep), entering),
+	(regex('^>>> (.*)$'), status),
+	(regex('building (%s)' % filep), status),
+	(regex('^--- (.*) ---$'), status),
+	(regex('^(Making %s)$' % filep), status),
+	(regex('^(Making %s from %s)$' % (filep, filep)), status),
+	(regex('^([0-9]+ warnings? generated.)$'), status),
+	(regex('^(%s -> %s)$' % (filep, filep)), status),
+	(regex('^((?:RPC)\t.*... [0-9]+)$'), status),
+
+	# "created an objdir" progress message
+	(regex('^(%s) created for (%s)$' % (filep, filep)), objdir),
+
+	# cd && do stuff
+	(
+		regex('^cd (.*) && (.*)$'),
+		lambda path, line: submake.append((path, line))
+	),
+
+	# other tool
+	(regex('^([a-z\+]+) (.*)$'), other_tool),
+
+	# unknown
+	(regex('(.*)'), lambda line: unparsed.append(line)),
+)
+
+line_count = 0
+for line in f:
+	line_count += 1
+	for (pattern, handler) in patterns:
+		match = pattern.match(line)
+		if match:
+			handler(*match.groups())
+			break
+
+# Convert executions into a map from tool to runs
+x = collections.defaultdict(list)
+for (key,value) in execs: x[key].append(value)
+execs = x
+
+print('processed %d lines from %s' % (line_count, args.filename))
+print('%d execs, %d status messages' % (
+	sum([ len(x) for x in execs.values() ]),
+	len(status_messages),
+))
+print('%d directory traversals' % len(dirs_entered))
+print('%d executions of %d tools' % (
+	sum([ len(runs) for runs in execs.values() ]), len(execs)))
+
+print('\n%d unparsed lines:' % len(unparsed))
+for u in unparsed[:10]:
+	print('?: ' + u[:70])
+
+build_log = {
+	'src_root': src_root,
+	'objdirs': objdirs,
+
+	'status_messages': status_messages,
+	'dirs_entered': dirs_entered,
+
+	'execs': execs,
+	'submake': submake,
+
+	'warnings': warnings,
+	'errors': errors,
+	'unparsed': unparsed
+}
+
+pickle.dump(build_log, out_file)
