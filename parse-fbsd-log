@@ -37,19 +37,27 @@ def entering(directory, ops): dirs_entered.append((directory, ops.split()))
 def status(msg): status_messages.append(msg)
 
 def srcdir(src):
+	run.set_src_root(src)
+	for e in execs:
+		new_inputs = []
+		for s in e.inputs: new_inputs.append(s.replace(src, ''))
+		e.inputs = new_inputs
+
 	global src_root
 	if src_root: assert src == src_root
 	else: src_root = src
 
 def objdir(obj, src): objdirs[src] = obj
 
-def cc(args): execs.append(('cc', args.split()))
-def cxx(args): execs.append(('cxx', args.split()))
-def echo(args): execs.append(('echo', args.split()))
-def install(args, dest): execs.append(('install.sh', (args, dest))),
+def cc(args): execs.append(crun(args.split()))
+def cxx(args): execs.append(cxxrun(args.split()))
+
+def echo(args): execs.append(run('echo', args = args.split()))
+def install(args, dest):
+	execs.append(run('install.sh', outputs = [ dest ], args = args)),
 
 def other_tool(name, args):
-	execs.append((name, args.split()))
+	execs.append(run(name, args = args.split()))
 
 # pattern for a filename
 filep = '[a-zA-Z0-9/_\-\.\+]+'
@@ -63,7 +71,7 @@ patterns = (
 
 	# file installation (staging)
 	(
-		regex('sh (%s/tools/install.sh) (.*) (/%s)' % (filep, filep)),
+		regex('sh (%s/)tools/install.sh (.*) (/%s)' % (filep, filep)),
 		lambda src_root, args, dest:
 			(srcdir(src_root), install(args.split(), dest))
 	),
@@ -72,8 +80,7 @@ patterns = (
 	(
 		regex('^cp (%s)+ (%s)$' % (filep, filep)),
 		lambda *files:
-			execs.append(('cp',
-				run(files[:-1], outputs = files[-1:])))
+			execs.append(run('cp', inputs = files[:-1], outputs = files[-1:]))
 	),
 
 	# C compilation
@@ -85,7 +92,7 @@ patterns = (
 	# make-roken (a kerberos thing)
 	(
 		regex('^(make-roken) > (%s)$' % filep),
-		lambda name, out: execs.append((name, run(outputs = [ out ])))
+		lambda name, out: execs.append(run(name, outputs = [ out ]))
 	),
 
 	# Clang warning
@@ -119,7 +126,7 @@ patterns = (
 	# sometimes rm *.o commands wrap around in the log... (!?)
 	(
 		regex('^((?:%s\.o(?:.tmp)?\s+)+)' % filep),
-		lambda files: execs[-1][1].append(files[0].split())
+		lambda files: execs[-1].outputs.append(files[0].split())
 	),
 
 	# yacc warning
@@ -152,7 +159,7 @@ patterns = (
 	),
 
 	# other tool
-	(regex('^([a-z\+]+) (.*)$'), other_tool),
+	#(regex('^([a-z\+]+) (.*)$'), other_tool),
 
 	# unknown
 	(regex('(.*)'), lambda line: unparsed.append(line)),
@@ -169,7 +176,7 @@ for line in f:
 
 # Convert executions into a map from tool to runs
 x = collections.defaultdict(list)
-for (key,value) in execs: x[key].append(value)
+for e in execs: x[e.tool].append(e)
 execs = x
 
 print('processed %d lines from %s' % (line_count, args.filename))
